@@ -1,0 +1,9 @@
+DROP INDEX `business_members_openid_idx` ON `business_members`;--> statement-breakpoint
+ALTER TABLE `business_members` ADD CONSTRAINT `business_members_user_uq` UNIQUE(`openId`);--> statement-breakpoint
+ALTER TABLE `business_invites` ADD CONSTRAINT `business_invites_businessId_businesses_id_fk` FOREIGN KEY (`businessId`) REFERENCES `businesses`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `business_invites` ADD CONSTRAINT `business_invites_createdByOpenId_users_openId_fk` FOREIGN KEY (`createdByOpenId`) REFERENCES `users`(`openId`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `business_members` ADD CONSTRAINT `business_members_businessId_businesses_id_fk` FOREIGN KEY (`businessId`) REFERENCES `businesses`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `business_members` ADD CONSTRAINT `business_members_openId_users_openId_fk` FOREIGN KEY (`openId`) REFERENCES `users`(`openId`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `business_records` ADD CONSTRAINT `business_records_businessId_businesses_id_fk` FOREIGN KEY (`businessId`) REFERENCES `businesses`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `business_records` ADD CONSTRAINT `business_records_createdByOpenId_users_openId_fk` FOREIGN KEY (`createdByOpenId`) REFERENCES `users`(`openId`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `businesses` ADD CONSTRAINT `businesses_createdByOpenId_users_openId_fk` FOREIGN KEY (`createdByOpenId`) REFERENCES `users`(`openId`) ON DELETE no action ON UPDATE no action;
