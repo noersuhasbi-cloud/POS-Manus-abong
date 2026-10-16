@@ -2,16 +2,18 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
 import { trpc } from "@/lib/trpc";
 import { formatMoney } from "@/shared/accounting";
-import type { MenuItem, OrderLine, OrderStatus, PaymentMethod, PosOrder, Transaction } from "@/shared/pos";
+import type { KitchenOrder, MenuItem, OrderLine, OrderStatus, PaymentMethod, PosOrder, Transaction } from "@/shared/pos";
 import { getDefaultMenu } from "@/shared/pos";
 import { useWorkspace } from "@/lib/workspace-context";
+import { bindLegacySnapshotOwner, LEGACY_STORAGE_KEY } from "@/lib/legacy-storage";
 
-export type { BusinessRole, BusinessSettings, CurrencyCode, GiftCard, Invoice, JournalEntry, LoyaltyAccount, LoyaltySettings, MenuItem, Modifier, OrderLine, OrderStatus, PaymentMethod, PosOrder, Promotion, TeamMember, Transaction, TransactionStatus, VendorBill, WorkspaceInvite } from "@/shared/pos";
+export type { BusinessRole, BusinessSettings, CurrencyCode, GiftCard, Invoice, JournalEntry, KitchenOrder, LoyaltyAccount, LoyaltySettings, MenuItem, Modifier, OrderLine, OrderStatus, PaymentMethod, PosOrder, Promotion, TeamMember, Transaction, TransactionStatus, VendorBill, WorkspaceInvite } from "@/shared/pos";
 export { getDefaultMenu } from "@/shared/pos";
 export const MENU: MenuItem[] = getDefaultMenu("IDR");
-export const LEGACY_STORAGE_KEY = "till-table-pos:local:v1";
+export { LEGACY_STORAGE_KEY } from "@/lib/legacy-storage";
 export type LegacyPosSnapshot = { orders: PosOrder[]; transactions: Transaction[] };
-export async function readLegacyPosSnapshot(): Promise<LegacyPosSnapshot> {
+export async function readLegacyPosSnapshot(openId: string): Promise<LegacyPosSnapshot> {
+  if (!(await bindLegacySnapshotOwner(openId))) return { orders: [], transactions: [] };
   const raw = await AsyncStorage.getItem(LEGACY_STORAGE_KEY);
   if (!raw) return { orders: [], transactions: [] };
   try {
@@ -36,8 +38,11 @@ export type CreateOrderInput = {
 };
 type PosContextValue = {
   menu: MenuItem[];
-  orders: PosOrder[];
+  orders: KitchenOrder[];
   transactions: Transaction[];
+  hasMoreTransactions: boolean;
+  isLoadingMoreTransactions: boolean;
+  loadMoreTransactions: () => Promise<void>;
   activePromotions: import("@/shared/pos").Promotion[];
   isLoaded: boolean;
   error: string | null;
@@ -45,7 +50,7 @@ type PosContextValue = {
   taxRateBasisPoints: number;
   money: (value: number) => string;
   createOrder: (requestId: string, input: CreateOrderInput) => Promise<PosOrder>;
-  updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<unknown>;
+  updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<KitchenOrder>;
   refundTransaction: (transactionId: string) => Promise<unknown>;
   voidTransaction: (transactionId: string) => Promise<unknown>;
 };
@@ -58,7 +63,7 @@ export function PosProvider({ children }: { children: ReactNode }) {
   const utils = trpc.useUtils();
   const menuQuery = trpc.pos.menu.useQuery(undefined, { enabled: enabled && canUseRegister, refetchInterval: 3_000, retry: 1 });
   const ordersQuery = trpc.pos.orders.useQuery(undefined, { enabled, refetchInterval: 3_000, retry: 1 });
-  const transactionsQuery = trpc.pos.transactions.useQuery(undefined, { enabled: enabled && canUseRegister, refetchInterval: 3_000, retry: 1 });
+  const transactionsQuery = trpc.pos.transactions.useInfiniteQuery({}, { enabled: enabled && canUseRegister, refetchInterval: 3_000, retry: 1, getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined });
   const promotionsQuery = trpc.programs.activePromotions.useQuery(undefined, { enabled: enabled && canUseRegister, refetchInterval: 3_000, retry: 1 });
   const createMutation = trpc.pos.createOrder.useMutation({ onSuccess: async () => { await Promise.all([utils.pos.menu.invalidate(), utils.pos.orders.invalidate(), utils.pos.transactions.invalidate(), utils.pos.inventory.invalidate(), utils.accounting.report.invalidate()]); } });
   const advanceMutation = trpc.pos.advanceOrder.useMutation({ onSuccess: () => utils.pos.orders.invalidate() });
@@ -82,15 +87,22 @@ export function PosProvider({ children }: { children: ReactNode }) {
     if (status === "new" || status === "cancelled") return Promise.reject(new Error("Use a valid kitchen transition."));
     return advanceMutation.mutateAsync({ orderId, status });
   }, [advanceMutation]);
+  const loadMoreTransactions = useCallback(async () => {
+    if (transactionsQuery.hasNextPage && !transactionsQuery.isFetchingNextPage) await transactionsQuery.fetchNextPage();
+  }, [transactionsQuery.fetchNextPage, transactionsQuery.hasNextPage, transactionsQuery.isFetchingNextPage]);
   const refundTransaction = useCallback((transactionId: string) => refundMutation.mutateAsync({ transactionId }), [refundMutation]);
   const voidTransaction = useCallback((transactionId: string) => voidMutation.mutateAsync({ transactionId }), [voidMutation]);
 
   const currency = workspace?.currency ?? "IDR";
+  const transactions = transactionsQuery.data?.pages.flatMap((page) => page.items) ?? [];
   const error = enabled ? [menuQuery.error, ordersQuery.error, transactionsQuery.error].find(Boolean)?.message ?? null : null;
   const value = useMemo<PosContextValue>(() => ({
     menu: enabled && canUseRegister ? menuQuery.data ?? [] : [],
     orders: enabled ? ordersQuery.data ?? [] : [],
-    transactions: enabled && canUseRegister ? transactionsQuery.data ?? [] : [],
+    transactions: enabled && canUseRegister ? transactions : [],
+    hasMoreTransactions: enabled && canUseRegister ? Boolean(transactionsQuery.hasNextPage) : false,
+    isLoadingMoreTransactions: transactionsQuery.isFetchingNextPage,
+    loadMoreTransactions,
     activePromotions: enabled && canUseRegister ? promotionsQuery.data ?? [] : [],
     isLoaded: !enabled || ordersQuery.isFetched && (!canUseRegister || menuQuery.isFetched && transactionsQuery.isFetched),
     error,
@@ -101,7 +113,7 @@ export function PosProvider({ children }: { children: ReactNode }) {
     updateOrderStatus,
     refundTransaction,
     voidTransaction,
-  }), [menuQuery.data, ordersQuery.data, transactionsQuery.data, promotionsQuery.data, menuQuery.isFetched, ordersQuery.isFetched, transactionsQuery.isFetched, enabled, canUseRegister, workspace?.taxRateBasisPoints, currency, error, createOrder, updateOrderStatus, refundTransaction, voidTransaction]);
+  }), [menuQuery.data, ordersQuery.data, transactions, transactionsQuery.hasNextPage, transactionsQuery.isFetchingNextPage, transactionsQuery.isFetched, promotionsQuery.data, menuQuery.isFetched, ordersQuery.isFetched, enabled, canUseRegister, workspace?.taxRateBasisPoints, currency, error, createOrder, updateOrderStatus, loadMoreTransactions, refundTransaction, voidTransaction]);
   return <PosContext.Provider value={value}>{children}</PosContext.Provider>;
 }
 

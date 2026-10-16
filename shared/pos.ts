@@ -19,6 +19,10 @@ export type InventoryMovement = {
   actorOpenId: string;
   purchaseQuantity?: number;
   purchaseUnit?: string;
+  purchaseOrderId?: string;
+  purchaseOrderLineId?: string;
+  goodsReceiptId?: string;
+  baseUnitsPerPurchaseUnit?: number;
 };
 
 export type Supplier = { id: string; name: string; contactName?: string; email?: string; phone?: string; notes?: string; active: boolean; createdAt: string; updatedAt: string };
@@ -99,6 +103,29 @@ export type PosOrder = {
   giftCardAmount?: number;
   qrisVerifiedAt?: string;
 };
+export type KitchenOrder = Pick<PosOrder, "id" | "number" | "createdAt" | "updatedAt" | "status"> & {
+  items: Array<Pick<OrderLine, "id" | "name" | "quantity" | "note"> & {
+    modifier?: Pick<Modifier, "id" | "label">;
+    modifiers?: Array<Pick<Modifier, "id" | "label">>;
+  }>;
+};
+export function projectKitchenOrder(order: PosOrder): KitchenOrder {
+  return {
+    id: order.id,
+    number: order.number,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    status: order.status,
+    items: order.items.map((item) => ({
+      id: item.id,
+      name: item.name,
+      quantity: item.quantity,
+      ...(item.modifier ? { modifier: { id: item.modifier.id, label: item.modifier.label } } : {}),
+      ...(item.modifiers?.length ? { modifiers: item.modifiers.map(({ id, label }) => ({ id, label })) } : {}),
+      ...(item.note ? { note: item.note } : {}),
+    })),
+  };
+}
 export type Transaction = {
   id: string;
   orderId: string;

@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, lt, or, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { businessRecords } from "../../drizzle/schema";
@@ -8,8 +8,9 @@ import { aggregateStockDemand, applyIngredientStockDelta, applyStockDelta, calcu
 import { planRecipeConsumption } from "../../shared/recipes";
 import { calculateLoyaltyRedemption, reverseLoyaltyPoints } from "../../shared/loyalty";
 import { evaluatePromotionAtCheckout, isPromotionActiveAt } from "../../shared/promotions";
+import { isSafeTransactionRecordId } from "../../shared/legacy";
 import { INGREDIENT_BASE_UNITS, INGREDIENT_PURCHASE_UNITS, isPositiveConversionFactor, normalizeBaseQuantity } from "../../shared/unit-conversion";
-import type { BillOfMaterial, CurrencyCode, InventoryMovement, JournalEntry, JournalLine, MenuItem, OrderLine, OrderStatus, PaymentMethod, PosOrder, Promotion, RecipeSaleCost, RecipeSaleCostLine, Transaction } from "../../shared/pos";
+import { projectKitchenOrder, type BillOfMaterial, type CurrencyCode, type InventoryMovement, type JournalEntry, type JournalLine, type MenuItem, type OrderLine, type OrderStatus, type PaymentMethod, type PosOrder, type Promotion, type RecipeSaleCost, type RecipeSaleCostLine, type Transaction } from "../../shared/pos";
 import { saveBusinessRecord } from "../db";
 import { cashierProcedure, kitchenProcedure, managerProcedure, requireDatabase, workspaceProcedure } from "../_core/business";
 import { router } from "../_core/trpc";
@@ -27,6 +28,7 @@ const validDateText = z.string().refine((value) => Number.isFinite(Date.parse(va
 const legacyOrderSchema = z.object({ id: z.string().min(1).max(60), number: z.string().min(1).max(40), createdAt: validDateText, updatedAt: validDateText, items: z.array(legacyLineSchema).min(1).max(80), subtotal: legacyMoney, discountPercent: z.number().finite().min(0).max(100), discount: legacyMoney, tax: legacyMoney, total: legacyMoney, paymentMethod: z.enum(["Cash", "Card", "QRIS", "Other"]), status: z.enum(["new", "preparing", "ready", "completed", "cancelled"]), cashierName: z.string().max(160).optional(), customerName: z.string().max(120).optional(), customerPhone: z.string().max(40).optional() });
 const legacyTransactionSchema = z.object({ id: z.string().min(1).max(60), orderId: z.string().min(1).max(60), orderNumber: z.string().min(1).max(40), createdAt: validDateText, items: z.array(legacyLineSchema).min(1).max(80), subtotal: legacyMoney, discount: legacyMoney, tax: legacyMoney, total: legacyMoney, paymentMethod: z.enum(["Cash", "Card", "QRIS", "Other"]), status: z.enum(["paid", "refunded", "voided"]), refundedAt: validDateText.optional(), voidedAt: validDateText.optional(), cashierName: z.string().max(160).optional(), customerName: z.string().max(120).optional(), customerPhone: z.string().max(40).optional() });
 const LEGACY_IMPORT_MARKER_ID = "legacy-v1";
+const transactionRecordId = z.string().refine(isSafeTransactionRecordId, "Invalid transaction ID.");
 
 function makeId() { return randomUUID(); }
 function roundFor(input: number, currency: CurrencyCode) { return roundAmount(input, currency); }
@@ -277,6 +279,9 @@ export const posRouter = router({
       if (duplicate) throw new TRPCError({ code: "CONFLICT", message: "A menu item with that name already exists in this workspace." });
       const previous = existing ? normalizePayload<MenuItem>(existing.payload) : undefined;
       const previouslyTracked = previous?.stockTracked === true;
+      if (previouslyTracked && input.stockUnit.trim() !== String(previous?.stockUnit ?? "unit").trim()) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "The stock unit cannot be changed after tracking begins; create a new menu item with the correct unit so the existing balance remains auditable." });
+      }
       const stockTracked = previouslyTracked || input.stockTracked;
       const openingStock = normalizeStockQuantity(input.openingStock);
       const stockOnHand = stockTracked ? previouslyTracked ? normalizeStockQuantity(Number(previous?.stockOnHand ?? 0)) : openingStock : undefined;
@@ -330,17 +335,31 @@ export const posRouter = router({
     const db = await requireDatabase();
     const rows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "order"))).orderBy(desc(businessRecords.createdAt)).limit(300);
     const orderMap = new Map<string, PosOrder>(rows.map((row) => [row.recordId, normalizePayload<PosOrder>(row.payload)]));
-    if (ctx.member.role !== "kitchen") return [...orderMap.values()];
+    if (ctx.member.role !== "kitchen") return [...orderMap.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(projectKitchenOrder);
     const activeRows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "order"), sql`JSON_UNQUOTE(JSON_EXTRACT(${businessRecords.payload}, '$.status')) IN ('new', 'preparing', 'ready')`)).orderBy(desc(businessRecords.createdAt));
     for (const row of activeRows) orderMap.set(row.recordId, normalizePayload<PosOrder>(row.payload));
     const orders = [...orderMap.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    return orders.map((order) => ({ id: order.id, number: order.number, createdAt: order.createdAt, updatedAt: order.updatedAt, items: order.items.map((item) => ({ id: item.id, name: item.name, quantity: item.quantity, modifier: item.modifier ? { id: item.modifier.id, label: item.modifier.label } : undefined, modifiers: (item.modifiers ?? []).map((modifier) => ({ id: modifier.id, label: modifier.label })), note: item.note })), status: order.status })) as unknown as PosOrder[];
+    return orders.map(projectKitchenOrder);
   }),
 
-  transactions: cashierProcedure.query(async ({ ctx }) => {
+  transactions: cashierProcedure.input(z.object({ cursor: z.object({ createdAt: z.string().datetime(), id: z.string().uuid() }).nullable().optional() }).default({})).query(async ({ ctx, input }) => {
     const db = await requireDatabase();
-    const rows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "transaction"))).orderBy(desc(businessRecords.createdAt)).limit(500);
-    return rows.map((row) => normalizePayload<Transaction>(row.payload));
+    const cursorDate = input.cursor ? new Date(input.cursor.createdAt) : undefined;
+    const cursorCondition = input.cursor && cursorDate
+      ? or(
+        lt(businessRecords.createdAt, cursorDate),
+        and(eq(businessRecords.createdAt, cursorDate), lt(businessRecords.id, input.cursor.id)),
+      )
+      : undefined;
+    const rows = await db.select().from(businessRecords)
+      .where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "transaction"), cursorCondition))
+      .orderBy(desc(businessRecords.createdAt), desc(businessRecords.id)).limit(101);
+    const pageRows = rows.slice(0, 100);
+    const last = pageRows.at(-1);
+    return {
+      items: pageRows.map((row) => normalizePayload<Transaction>(row.payload)),
+      nextCursor: rows.length > 100 && last ? { createdAt: new Date(last.createdAt).toISOString(), id: last.id } : null,
+    };
   }),
 
   checkoutStatus: cashierProcedure.input(z.object({ requestId: z.string().uuid() })).query(async ({ ctx, input }) => {
@@ -466,7 +485,9 @@ export const posRouter = router({
         if (promotionRow.payload.code) throw new TRPCError({ code: "BAD_REQUEST", message: "Enter this promotion's coupon code to apply it." });
       } else if (input.discountCode) {
         const offers = await listRecordsTx(tx, ctx.member.businessId, "promotion");
-        promotionRow = offers.find((row: any) => String(row.payload.code ?? "").toUpperCase() === input.discountCode!.trim().toUpperCase());
+        const matches = offers.filter((row: any) => String(row.payload.code ?? "").trim().toUpperCase() === input.discountCode!.trim().toUpperCase());
+        if (matches.length > 1) throw new TRPCError({ code: "CONFLICT", message: "This coupon code is assigned to multiple offers. A manager must resolve the duplicate before checkout." });
+        promotionRow = matches[0];
         if (!promotionRow || !activeAt(promotionRow.payload, nowMs, businessTimezone)) throw new TRPCError({ code: "BAD_REQUEST", message: "That coupon is invalid or expired." });
         couponCode = String(promotionRow.payload.code);
       }
@@ -532,7 +553,8 @@ export const posRouter = router({
         discountAllocatedSoFar = roundFor(discountAllocatedSoFar + discountAllocated, currency);
         return { ...draft, recipeUnitCost: roundFor(draft.recipeUnitCost, currency), recipeCost: roundFor(draft.recipeCost, currency), ingredients: draft.ingredients.map((component) => ({ ...component, totalCost: roundFor(component.totalCost, currency) })), quantity: line.quantity, grossSales, discountAllocated, netSales: roundFor(Math.max(0, grossSales - discountAllocated), currency) };
       });
-      loyaltyPointsEarned = loyaltyAccount ? Math.floor(Math.max(0, subtotal - discount) / Math.max(1, loyaltyCurrencyStep)) * Math.max(0, loyaltyEarnPerStep) : 0;
+      if (loyaltyAccount && (!Number.isFinite(loyaltyCurrencyStep) || loyaltyCurrencyStep <= 0)) throw new TRPCError({ code: "BAD_REQUEST", message: "The workspace loyalty spend threshold is invalid; update the loyalty rules before checkout." });
+      loyaltyPointsEarned = loyaltyAccount ? Math.floor(Math.max(0, subtotal - discount) / loyaltyCurrencyStep) * Math.max(0, loyaltyEarnPerStep) : 0;
       if (input.paymentMethod === "QRIS" && !input.qrisVerified) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Verify the payment in your QRIS merchant app before recording this ticket as paid." });
       let giftCardId: string | undefined;
       if (input.paymentMethod === "Gift Card") {
@@ -621,17 +643,18 @@ export const posRouter = router({
       if (!allowed[order.status].includes(input.status)) throw new TRPCError({ code: "BAD_REQUEST", message: "Move the ticket through the kitchen stages in order." });
       const next = { ...order, status: input.status, updatedAt: new Date().toISOString() };
       await saveBusinessRecord(tx, { businessId: ctx.member.businessId, recordKind: "order", recordId: order.id, payload: next as unknown as Record<string, unknown>, actorOpenId: ctx.user.openId });
-      return next;
+      return projectKitchenOrder(next);
     });
   }),
 
-  refund: managerProcedure.input(z.object({ transactionId: z.string().uuid() })).mutation(async ({ ctx, input }) => {
+  refund: managerProcedure.input(z.object({ transactionId: transactionRecordId })).mutation(async ({ ctx, input }) => {
     const db = await requireDatabase();
     const currency = ctx.member.business.currency as CurrencyCode;
     return db.transaction(async (tx) => {
       const row = await getRecordTx(tx, ctx.member.businessId, "transaction", input.transactionId);
       if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Transaction not found." });
       const transaction = normalizePayload<Transaction & { giftCardId?: string }>(row.payload);
+      if (transaction.status === "refunded" && transaction.refundJournalEntryId) return transaction;
       if (transaction.status !== "paid") throw new TRPCError({ code: "BAD_REQUEST", message: "Only a paid ticket can be refunded." });
       const now = new Date().toISOString();
       const reversal = await postJournal(tx, ctx.member.businessId, ctx.user.openId, currency, { date: now, reference: `REFUND ${transaction.orderNumber}`, description: `Full refund for ${transaction.orderNumber}`, lines: addReversalLines(transaction, currency) });
@@ -647,13 +670,14 @@ export const posRouter = router({
     });
   }),
 
-  voidSale: managerProcedure.input(z.object({ transactionId: z.string().uuid() })).mutation(async ({ ctx, input }) => {
+  voidSale: managerProcedure.input(z.object({ transactionId: transactionRecordId })).mutation(async ({ ctx, input }) => {
     const db = await requireDatabase();
     const currency = ctx.member.business.currency as CurrencyCode;
     return db.transaction(async (tx) => {
       const row = await getRecordTx(tx, ctx.member.businessId, "transaction", input.transactionId);
       if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Transaction not found." });
       const transaction = normalizePayload<Transaction & { giftCardId?: string }>(row.payload);
+      if (transaction.status === "voided" && transaction.voidJournalEntryId) return transaction;
       if (transaction.status !== "paid") throw new TRPCError({ code: "BAD_REQUEST", message: "Only a paid ticket can be voided." });
       const now = new Date().toISOString();
       const reversal = await postJournal(tx, ctx.member.businessId, ctx.user.openId, currency, { date: now, reference: `VOID ${transaction.orderNumber}`, description: `Void ${transaction.orderNumber}`, lines: addReversalLines(transaction, currency) });
@@ -669,7 +693,8 @@ export const posRouter = router({
     });
   }),
 
-  importLegacy: managerProcedure.input(z.object({ currencyConfirmed: z.boolean(), orders: z.array(legacyOrderSchema).max(1000), transactions: z.array(legacyTransactionSchema).max(1000) })).mutation(async ({ ctx, input }) => {
+  importLegacy: managerProcedure.input(z.object({ ownerOpenId: z.string().min(1).max(191), currencyConfirmed: z.boolean(), orders: z.array(legacyOrderSchema).max(1000), transactions: z.array(legacyTransactionSchema).max(1000) })).mutation(async ({ ctx, input }) => {
+    if (input.ownerOpenId !== ctx.user.openId) throw new TRPCError({ code: "FORBIDDEN", message: "These local register records belong to a different signed-in account." });
     if (!input.currencyConfirmed) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Confirm that the workspace currency matches the unchanged local amounts before importing." });
     const db = await requireDatabase();
     const currency = ctx.member.business.currency as CurrencyCode;

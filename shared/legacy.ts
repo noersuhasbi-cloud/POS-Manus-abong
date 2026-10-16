@@ -9,3 +9,11 @@ export function toLegacyImportRecord<T extends { paymentMethod: PaymentMethod }>
   }
   return record as Omit<T, "paymentMethod"> & { paymentMethod: LegacyPaymentMethod };
 }
+
+export function legacySnapshotOwnerCanAccess(ownerOpenId: string | null, requestedOpenId: string) {
+  return !ownerOpenId || ownerOpenId === requestedOpenId;
+}
+
+export function isSafeTransactionRecordId(value: string) {
+  return value.length > 0 && value.length <= 80 && !/[\u0000-\u001f\u007f]/.test(value);
+}

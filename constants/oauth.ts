@@ -1,5 +1,6 @@
 import * as Linking from "expo-linking";
 import Constants from "expo-constants";
+import * as SecureStore from "expo-secure-store";
 import * as ReactNative from "react-native";
 
 // Extract scheme from bundle ID (last segment timestamp, prefixed with "manus")
@@ -54,6 +55,8 @@ export function getApiBaseUrl(): string {
 
 export const SESSION_TOKEN_KEY = "app_session_token";
 export const USER_INFO_KEY = "manus-runtime-user-info";
+export const NATIVE_OAUTH_STATE_KEY = "native-oauth-pending-state";
+const NATIVE_OAUTH_CONSUMED_STATE_KEY = "native-oauth-consumed-state";
 
 const encodeState = (value: string) => {
   if (typeof globalThis.btoa === "function") {
@@ -63,8 +66,57 @@ const encodeState = (value: string) => {
   if (BufferImpl) {
     return BufferImpl.from(value, "utf-8").toString("base64");
   }
-  return value;
+  throw new Error("This device cannot encode a secure sign-in state.");
 };
+
+function createNativeOAuthNonce() {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi || typeof cryptoApi.getRandomValues !== "function") {
+    throw new Error("Secure sign-in randomness is unavailable on this device.");
+  }
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function isFreshNativeOAuthState(value: string) {
+  try {
+    const BufferImpl = (globalThis as Record<string, any>).Buffer;
+    const decoded = typeof globalThis.atob === "function"
+      ? globalThis.atob(value)
+      : BufferImpl ? BufferImpl.from(value, "base64").toString("utf-8") : "";
+    const state = JSON.parse(decoded) as { redirectUri?: unknown; nonce?: unknown; issuedAt?: unknown };
+    const ageMs = typeof state.issuedAt === "number" ? Date.now() - state.issuedAt : Number.POSITIVE_INFINITY;
+    return state.redirectUri === getRedirectUri()
+      && typeof state.nonce === "string"
+      && /^[a-f0-9]{64}$/.test(state.nonce)
+      && ageMs >= -60_000
+      && ageMs <= 10 * 60_000;
+  } catch {
+    return false;
+  }
+}
+
+export async function consumeNativeOAuthState(actualState: string | null | undefined) {
+  const expectedState = await SecureStore.getItemAsync(NATIVE_OAUTH_STATE_KEY);
+  if (!expectedState || !actualState || expectedState !== actualState || !isFreshNativeOAuthState(expectedState)) return false;
+  const consumedState = await SecureStore.getItemAsync(NATIVE_OAUTH_CONSUMED_STATE_KEY);
+  if (consumedState === expectedState) return false;
+  try {
+    await SecureStore.setItemAsync(NATIVE_OAUTH_CONSUMED_STATE_KEY, expectedState);
+    await SecureStore.deleteItemAsync(NATIVE_OAUTH_STATE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function clearPendingNativeOAuthState() {
+  try {
+    await SecureStore.deleteItemAsync(NATIVE_OAUTH_STATE_KEY);
+  } catch {
+    // The pending state is short lived; callback validation still fails closed if it remains.
+  }
+}
 
 /**
  * Get the redirect URI for OAuth callback.
@@ -82,12 +134,10 @@ export const getRedirectUri = () => {
   }
 };
 
-export const getLoginUrl = () => {
+export const getLoginUrl = (state: string, redirectUri: string) => {
   if (!OAUTH_PORTAL_URL || !APP_ID) {
     throw new Error("Manus login configuration is unavailable");
   }
-  const redirectUri = getRedirectUri();
-  const state = encodeState(redirectUri);
 
   const url = new URL(`${OAUTH_PORTAL_URL}/app-auth`);
   url.searchParams.set("appId", APP_ID);
@@ -127,20 +177,17 @@ export async function startOAuthLogin(): Promise<string | null> {
     return null;
   }
 
-  const loginUrl = getLoginUrl();
-
-  const supported = await Linking.canOpenURL(loginUrl);
-  if (!supported) {
-    console.warn("[OAuth] Cannot open login URL: URL scheme not supported");
-    // 可考虑抛出错误或返回错误状态，让调用方处理
-    return null;
-  }
-
   try {
+    const redirectUri = getRedirectUri();
+    const state = encodeState(JSON.stringify({ redirectUri, nonce: createNativeOAuthNonce(), issuedAt: Date.now() }));
+    await SecureStore.setItemAsync(NATIVE_OAUTH_STATE_KEY, state);
+    const loginUrl = getLoginUrl(state, redirectUri);
+    const supported = await Linking.canOpenURL(loginUrl);
+    if (!supported) throw new Error("This device cannot open the Manus sign-in page.");
     await Linking.openURL(loginUrl);
-  } catch {
-    console.error("[OAuth] Failed to open login URL");
-    // 可考虑抛出错误让调用方处理
+  } catch (error) {
+    await clearPendingNativeOAuthState();
+    throw error instanceof Error ? error : new Error("Could not open Manus sign-in.");
   }
 
   // The OAuth callback will reopen the app via deep link.

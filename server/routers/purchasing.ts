@@ -8,7 +8,7 @@ import { applyIngredientStockDelta, applyStockDelta, normalizeStockQuantity } fr
 import { applyPurchaseReceipt, linkedPurchaseRequestStatus } from "../../shared/purchasing";
 import { convertPurchaseToBaseQuantity, isPositiveConversionFactor, normalizeBaseQuantity } from "../../shared/unit-conversion";
 import type { CurrencyCode, GoodsReceipt, InventoryMovement, MenuItem, PurchaseOrder, PurchaseOrderLine, PurchaseRequest, Supplier } from "../../shared/pos";
-import { saveBusinessRecord } from "../db";
+import { lockBusinessForUpdate, saveBusinessRecord } from "../db";
 import { cashierProcedure, managerProcedure, requireDatabase } from "../_core/business";
 import { router } from "../_core/trpc";
 
@@ -289,15 +289,18 @@ export const purchasingRouter = router({
     const canonicalItems = [...input.items].sort((a, b) => a.lineId.localeCompare(b.lineId));
     const receiptFingerprint = fingerprint({ purchaseOrderId: input.purchaseOrderId, note: input.note, items: canonicalItems });
     return db.transaction(async (tx) => {
-      const orderRow = await getRecordTx(tx, ctx.member.businessId, "purchaseOrder", input.purchaseOrderId);
-      if (!orderRow) throw new TRPCError({ code: "NOT_FOUND", message: "Purchase order not found in this workspace." });
-      const order = recordPayload<PurchaseOrder>(orderRow);
+      await lockBusinessForUpdate(tx, ctx.member.businessId);
       const existingReceipt = await getRecordTx(tx, ctx.member.businessId, "goodsReceipt", input.requestId);
       if (existingReceipt) {
         const prior = recordPayload<GoodsReceipt>(existingReceipt);
-        if (prior.purchaseOrderId !== order.id || prior.requestFingerprint !== receiptFingerprint) conflict("This receipt request key was already used for a different delivery.");
-        return { receipt: prior, purchaseOrder: order };
+        if (prior.purchaseOrderId !== input.purchaseOrderId || prior.requestFingerprint !== receiptFingerprint) conflict("This receipt request key was already used for a different delivery.");
+        const existingOrderRow = await getRecordTx(tx, ctx.member.businessId, "purchaseOrder", prior.purchaseOrderId);
+        if (!existingOrderRow) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "The purchase order linked to this receipt is missing." });
+        return { receipt: prior, purchaseOrder: recordPayload<PurchaseOrder>(existingOrderRow) };
       }
+      const orderRow = await getRecordTx(tx, ctx.member.businessId, "purchaseOrder", input.purchaseOrderId);
+      if (!orderRow) throw new TRPCError({ code: "NOT_FOUND", message: "Purchase order not found in this workspace." });
+      const order = recordPayload<PurchaseOrder>(orderRow);
       if (order.status === "received") throw new TRPCError({ code: "BAD_REQUEST", message: "This purchase order has already been fully received." });
       const next = (() => {
         try { return applyPurchaseReceipt(order, canonicalItems); }
@@ -316,6 +319,8 @@ export const purchasingRouter = router({
         if (!itemRow) throw new TRPCError({ code: "NOT_FOUND", message: `${line.itemName} was removed from this workspace; no receipt was posted.` });
         const item = recordPayload<MenuItem>(itemRow);
         if (item.stockTracked !== true) throw new TRPCError({ code: "BAD_REQUEST", message: `Stock tracking was disabled for ${item.name}; no receipt was posted.` });
+        const receiptStockUnit = line.stockUnit ?? item.stockUnit ?? line.unit;
+        if (line.stockUnit && item.stockUnit && line.stockUnit.trim() !== item.stockUnit.trim()) throw new TRPCError({ code: "BAD_REQUEST", message: `The stock unit for ${item.name} no longer matches this purchase-order snapshot. Reconcile the item before receiving; no receipt was posted.` });
         const factor = Number(line.baseUnitsPerPurchaseUnit ?? 1);
         if (!isPositiveConversionFactor(factor)) throw new TRPCError({ code: "BAD_REQUEST", message: `The saved purchase conversion for ${line.itemName} is invalid; no receipt was posted.` });
         const baseQuantity = convertPurchaseToBaseQuantity(quantity, factor);
@@ -331,13 +336,13 @@ export const purchasingRouter = router({
         }
         const updatedItem = { ...item, stockOnHand: after, unitCost };
         await saveBusinessRecord(tx, { businessId: ctx.member.businessId, recordKind: "menuItem", recordId: item.id, payload: updatedItem as unknown as Record<string, unknown>, actorOpenId: ctx.user.openId });
-        goodsReceiptLines.push({ lineId: line.id, itemId: item.id, itemName: item.name, unit: line.unit, quantity, quantityBefore: before, quantityAfter: after, stockUnit: line.stockUnit ?? item.stockUnit ?? "unit", baseQuantity, baseUnitsPerPurchaseUnit: factor });
+        goodsReceiptLines.push({ lineId: line.id, itemId: item.id, itemName: item.name, unit: line.unit, quantity, quantityBefore: before, quantityAfter: after, stockUnit: receiptStockUnit, baseQuantity, baseUnitsPerPurchaseUnit: factor });
         const movementId = newId();
         const movement: InventoryMovement = {
           id: movementId,
           itemId: item.id,
           itemName: item.name,
-          unit: item.stockUnit ?? line.unit,
+          unit: receiptStockUnit,
           kind: "receipt",
           quantityDelta: baseQuantity,
           quantityBefore: before,
@@ -348,6 +353,10 @@ export const purchasingRouter = router({
           actorOpenId: ctx.user.openId,
           purchaseQuantity: quantity,
           purchaseUnit: line.unit,
+          purchaseOrderId: order.id,
+          purchaseOrderLineId: line.id,
+          goodsReceiptId: input.requestId,
+          baseUnitsPerPurchaseUnit: factor,
         };
         await saveBusinessRecord(tx, { businessId: ctx.member.businessId, recordKind: "stockMovement", recordId: movementId, payload: movement as unknown as Record<string, unknown>, actorOpenId: ctx.user.openId });
       }

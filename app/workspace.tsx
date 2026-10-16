@@ -5,7 +5,8 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { Card, palette, Pill, PrimaryButton, Wordmark } from "@/components/pos/ui";
-import { LEGACY_STORAGE_KEY, readLegacyPosSnapshot } from "@/lib/pos-store";
+import { readLegacyPosSnapshot } from "@/lib/pos-store";
+import { legacyImportKey } from "@/lib/legacy-storage";
 import { useWorkspace } from "@/lib/workspace-context";
 import { trpc } from "@/lib/trpc";
 import type { CurrencyCode } from "@/shared/pos";
@@ -13,7 +14,7 @@ import { toLegacyImportRecord } from "@/shared/legacy";
 
 export default function WorkspaceSetupScreen() {
   const router = useRouter();
-  const { isAuthenticated, authLoading, refreshWorkspace, logout } = useWorkspace();
+  const { isAuthenticated, authLoading, refreshWorkspace, logout, user } = useWorkspace();
   const utils = trpc.useUtils();
   const create = trpc.workspace.create.useMutation();
   const join = trpc.workspace.join.useMutation();
@@ -26,16 +27,27 @@ export default function WorkspaceSetupScreen() {
   const [mode, setMode] = useState<"create" | "join">("create");
   const [importOld, setImportOld] = useState(false);
   const [currencyConfirmed, setCurrencyConfirmed] = useState(false);
-  const [snapshot, setSnapshot] = useState({ orders: [], transactions: [] } as Awaited<ReturnType<typeof readLegacyPosSnapshot>>);
-  const [legacyChecked, setLegacyChecked] = useState(false);
+  const emptySnapshot = { orders: [], transactions: [] } as Awaited<ReturnType<typeof readLegacyPosSnapshot>>;
+  const [legacyState, setLegacyState] = useState<{ ownerOpenId: string; snapshot: typeof emptySnapshot; checked: boolean }>({ ownerOpenId: "", snapshot: emptySnapshot, checked: false });
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const snapshot = user?.openId && legacyState.ownerOpenId === user.openId ? legacyState.snapshot : emptySnapshot;
+  const legacyChecked = Boolean(user?.openId && legacyState.ownerOpenId === user.openId && legacyState.checked);
   const existingCount = snapshot.orders.length + snapshot.transactions.length;
-  useEffect(() => { void readLegacyPosSnapshot().then((value) => { setSnapshot(value); setLegacyChecked(true); }).catch(() => setLegacyChecked(true)); }, []);
+  useEffect(() => {
+    let active = true;
+    const openId = user?.openId;
+    if (!openId) return () => { active = false; };
+    void readLegacyPosSnapshot(openId)
+      .then((value) => { if (active) setLegacyState({ ownerOpenId: openId, snapshot: value, checked: true }); })
+      .catch(() => { if (active) setLegacyState({ ownerOpenId: openId, snapshot: { orders: [], transactions: [] }, checked: true }); });
+    return () => { active = false; };
+  }, [user?.openId]);
 
   async function completeWorkspace() {
     setError(""); setNotice("");
     try {
+      if (!user?.openId) throw new Error("Your sign-in session could not be verified. Please sign in again.");
       if (mode === "join") {
         await join.mutateAsync({ code: code.trim() });
       } else {
@@ -45,8 +57,8 @@ export default function WorkspaceSetupScreen() {
         if (importOld && existingCount > 0) {
           if (!currencyConfirmed) throw new Error("Confirm the selected currency matches the old register amounts before importing.");
           try {
-            const result = await importLegacy.mutateAsync({ currencyConfirmed: true, orders: snapshot.orders.map(toLegacyImportRecord), transactions: snapshot.transactions.map(toLegacyImportRecord) });
-            await AsyncStorage.setItem(`${LEGACY_STORAGE_KEY}:imported`, result.importId);
+            const result = await importLegacy.mutateAsync({ ownerOpenId: user.openId, currencyConfirmed: true, orders: snapshot.orders.map(toLegacyImportRecord), transactions: snapshot.transactions.map(toLegacyImportRecord) });
+            await AsyncStorage.setItem(legacyImportKey(user.openId), result.importId);
             setNotice(`${result.imported} local records imported without changing their amounts.`);
           } catch (importError) {
             setNotice("Workspace created. The local records remain on this device; import can be retried from Manage.");

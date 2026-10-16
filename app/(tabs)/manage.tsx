@@ -4,10 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, Modal, Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View } from "react-native";
 import { ScreenContainer } from "@/components/screen-container";
 import { Card, EmptyState, PageHeader, palette, Pill, PrimaryButton, SectionTitle, Wordmark } from "@/components/pos/ui";
-import { LEGACY_STORAGE_KEY, readLegacyPosSnapshot, usePos } from "@/lib/pos-store";
+import { readLegacyPosSnapshot, usePos } from "@/lib/pos-store";
+import { legacyImportKey } from "@/lib/legacy-storage";
 import { useWorkspace } from "@/lib/workspace-context";
 import { trpc } from "@/lib/trpc";
-import { formatMoney } from "@/shared/accounting";
+import { formatMoney, roundPositiveAmount } from "@/shared/accounting";
 import { toLegacyImportRecord } from "@/shared/legacy";
 import type { BusinessRole, MenuItem } from "@/shared/pos";
 import { CashierPurchaseRequestPanel, PurchasingPanel } from "@/components/pos/purchasing-panel";
@@ -29,7 +30,7 @@ function ask(title: string, message: string, action: () => void) {
 function roleLabel(role: BusinessRole) { return role === "manager" ? "Manager" : role === "cashier" ? "Cashier" : "Kitchen"; }
 
 export default function ManageScreen() {
-  const { workspace, logout } = useWorkspace();
+  const { workspace, logout, user } = useWorkspace();
   const { menu } = usePos();
   const manager = workspace?.role === "manager";
   const utils = trpc.useUtils();
@@ -65,9 +66,12 @@ export default function ManageScreen() {
   const [businessName, setBusinessName] = useState<string | null>(null);
   const [taxPercent, setTaxPercent] = useState<string | null>(null);
   const [businessTimezone, setBusinessTimezone] = useState<string | null>(null);
-  const [legacy, setLegacy] = useState<Awaited<ReturnType<typeof readLegacyPosSnapshot>>>({ orders: [], transactions: [] });
-  const [legacyRead, setLegacyRead] = useState(false);
-  const [alreadyImported, setAlreadyImported] = useState(false);
+  const emptyLegacy = { orders: [], transactions: [] } as Awaited<ReturnType<typeof readLegacyPosSnapshot>>;
+  const [legacyState, setLegacyState] = useState<{ ownerOpenId: string; snapshot: typeof emptyLegacy; ready: boolean; alreadyImported: boolean }>({ ownerOpenId: "", snapshot: emptyLegacy, ready: false, alreadyImported: false });
+  const legacyMatchesUser = Boolean(manager && user?.openId && legacyState.ownerOpenId === user.openId);
+  const legacy = legacyMatchesUser ? legacyState.snapshot : emptyLegacy;
+  const legacyRead = legacyMatchesUser && legacyState.ready;
+  const alreadyImported = legacyMatchesUser && legacyState.alreadyImported;
   const [legacyConfirmed, setLegacyConfirmed] = useState(false);
   const [menuId, setMenuId] = useState<string | null>(null);
   const [menuName, setMenuName] = useState("");
@@ -91,7 +95,7 @@ export default function ManageScreen() {
 
   const members = trpc.workspace.members.useQuery(undefined, { enabled: manager, refetchInterval: 3_000 });
   const invites = trpc.workspace.invites.useQuery(undefined, { enabled: manager, refetchInterval: 3_000 });
-  const settings = trpc.workspace.settings.useQuery(undefined, { enabled: manager, staleTime: 0, refetchInterval: 3_000 });
+  const settings = trpc.workspace.settings.useQuery(undefined, { enabled: manager, staleTime: 0, refetchInterval: 3_000, refetchOnMount: "always" });
   const promotions = trpc.programs.promotions.useQuery(undefined, { enabled: manager, refetchInterval: 3_000 });
   const giftCards = trpc.programs.giftCards.useQuery(undefined, { enabled: manager, refetchInterval: 3_000 });
   const giftMovements = trpc.programs.giftCardMovements.useQuery(undefined, { enabled: manager, refetchInterval: 3_000 });
@@ -111,6 +115,7 @@ export default function ManageScreen() {
   const receiveStock = trpc.pos.receiveStock.useMutation();
   const stockOpname = trpc.pos.stockOpname.useMutation();
   const importLegacy = trpc.pos.importLegacy.useMutation();
+  const settingsReady = manager && settings.isSuccess && !settings.isError && !settings.isFetching && Boolean(settings.data);
   const currencyMoney = (value: number) => formatMoney(value, workspace?.currency ?? "IDR");
   const pendingInviteCount = useMemo(() => invites.data?.filter((invite) => !invite.usedAt && !invite.revokedAt && new Date(invite.expiresAt).getTime() > now).length ?? 0, [invites.data, now]);
   const recordCount = legacy.orders.length + legacy.transactions.length;
@@ -126,10 +131,17 @@ export default function ManageScreen() {
   const trackedItems = inventory.data?.items ?? [];
   const lowStockCount = trackedItems.filter((item) => Number(item.stockOnHand ?? 0) <= Number(item.lowStockThreshold ?? 0)).length;
   useEffect(() => {
-    if (!manager) return;
-    void readLegacyPosSnapshot().then(setLegacy).finally(() => setLegacyRead(true));
-    void AsyncStorage.getItem(`${LEGACY_STORAGE_KEY}:imported`).then((value) => setAlreadyImported(Boolean(value)));
-  }, [manager]);
+    let active = true;
+    const openId = manager ? user?.openId : undefined;
+    if (!openId) return () => { active = false; };
+    void Promise.all([
+      readLegacyPosSnapshot(openId).catch(() => ({ orders: [], transactions: [] })),
+      AsyncStorage.getItem(legacyImportKey(openId)).catch(() => null),
+    ]).then(([snapshot, imported]) => {
+      if (active) setLegacyState({ ownerOpenId: openId, snapshot, ready: true, alreadyImported: Boolean(imported) });
+    });
+    return () => { active = false; };
+  }, [manager, user?.openId]);
 
   async function refreshTeam() { await Promise.all([utils.workspace.members.invalidate(), utils.workspace.invites.invalidate()]); }
   async function refreshPrograms() { await Promise.all([utils.programs.promotions.invalidate(), utils.programs.giftCards.invalidate(), utils.programs.giftCardMovements.invalidate(), utils.programs.loyaltySettings.invalidate(), utils.programs.loyaltyCustomers.invalidate(), utils.programs.loyaltyMovements.invalidate()]); }
@@ -206,7 +218,7 @@ export default function ManageScreen() {
   }
   async function issueCard() {
     setError(""); setNotice(""); const amount = Number(giftAmount);
-    if (!Number.isFinite(amount) || amount <= 0) { setError("Enter a positive gift-card value."); return; }
+    if (!Number.isFinite(amount) || roundPositiveAmount(amount, workspace?.currency ?? "IDR") === null) { setError(`Enter a gift-card value that rounds to at least one ${workspace?.currency ?? "IDR"} minor unit.`); return; }
     if (giftMethod === "QRIS" && !qrisVerified) { setError("Verify QRIS in the merchant app before issuing the gift card."); return; }
     ask("Issue a gift card?", `${currencyMoney(amount)} will be recorded as gift-card liability${giftMethod === "QRIS" ? " after manual QRIS verification" : ""}. The card code will be shown only once.`, () => void (async () => {
       try { const result = await issueGift.mutateAsync({ amount, paymentMethod: giftMethod, customerName: giftCustomer.trim() || undefined, qrisVerified }); setGiftCodeOnce(result.code); setGiftAmount(""); setGiftCustomer(""); setQrisVerified(false); await refreshPrograms(); }
@@ -220,15 +232,18 @@ export default function ManageScreen() {
     catch (err) { setError(err instanceof Error ? err.message : "Loyalty settings were not saved."); }
   }
   async function saveBusiness() {
+    if (!settingsReady) { setError("Workspace settings have not loaded successfully. Retry before saving to avoid overwriting them with defaults."); return; }
     const tax = Number(taxPercentValue);
     if (!businessNameValue.trim() || !Number.isFinite(tax) || tax < 0 || tax > 30) { setError("Enter a business name and tax rate from 0% to 30%."); return; }
     try { await updateSettings.mutateAsync({ name: businessNameValue.trim(), taxRateBasisPoints: Math.round(tax * 100), timezone: businessTimezoneValue.trim() }); await Promise.all([utils.workspace.settings.invalidate(), utils.workspace.current.invalidate()]); await settings.refetch(); setNotice("Business settings saved."); }
     catch (err) { setError(err instanceof Error ? err.message : "Business settings were not saved. Check that the business time zone is a valid IANA name."); }
   }
   async function importOldRecords() {
+    if (!user?.openId) { setError("Your sign-in session could not be verified. Please sign in again before importing."); return; }
+    if (!legacyRead) { setError("Local register ownership is still being verified. Wait for it to finish, then retry."); return; }
     if (!recordCount || !legacyConfirmed) { setError("Confirm that the local amounts match this workspace currency before importing."); return; }
     ask("Import old register data?", `${recordCount} old records will be copied into ${workspace?.name ?? "this workspace"} without converting their amounts. Confirm that the chosen workspace currency already matches those records.`, () => void (async () => {
-      try { const result = await importLegacy.mutateAsync({ currencyConfirmed: true, orders: legacy.orders.map(toLegacyImportRecord), transactions: legacy.transactions.map(toLegacyImportRecord) }); await AsyncStorage.setItem(`${LEGACY_STORAGE_KEY}:imported`, result.importId); setAlreadyImported(true); setNotice(result.alreadyImported ? "These records were already imported." : `${result.imported} records imported unchanged.`); }
+      try { const result = await importLegacy.mutateAsync({ ownerOpenId: user.openId, currencyConfirmed: true, orders: legacy.orders.map(toLegacyImportRecord), transactions: legacy.transactions.map(toLegacyImportRecord) }); await AsyncStorage.setItem(legacyImportKey(user.openId), result.importId); setLegacyState((current) => current.ownerOpenId === user.openId ? { ...current, alreadyImported: true } : current); setNotice(result.alreadyImported ? "These records were already imported." : `${result.imported} records imported unchanged.`); }
       catch (err) { setError(err instanceof Error ? err.message : "Import failed. The original on-device records remain intact."); }
     })());
   }
@@ -316,6 +331,8 @@ export default function ManageScreen() {
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.sectionTabs}>{sections.map((value) => <Pill key={value} label={value} selected={section === value} onPress={() => { setSection(value); setError(""); setNotice(""); }} />)}</ScrollView>
         {error ? <View style={styles.errorBanner}><MaterialIcons name="error-outline" size={15} color={palette.coral} /><Text style={styles.errorText}>{error}</Text></View> : null}
         {notice ? <Pressable onPress={() => setNotice("")} style={styles.notice}><MaterialIcons name="check-circle" size={15} color={palette.evergreen} /><Text style={styles.noticeText}>{notice}</Text><MaterialIcons name="close" size={14} color={palette.muted} /></Pressable> : null}
+
+        {section === "Settings" && !settingsReady ? <View style={styles.errorBanner}><MaterialIcons name={settings.isError ? "cloud-off" : "hourglass-empty"} size={15} color={settings.isError ? palette.coral : palette.muted} /><Text style={styles.errorText}>{settings.isError ? `Saved workspace settings could not be loaded${settings.error instanceof Error ? `: ${settings.error.message}` : "."} No fallback values can be saved.` : "Loading saved workspace settings. Saving is disabled until they load."}</Text>{settings.isError ? <Pressable onPress={() => void settings.refetch()}><Text style={styles.changeRoleText}>Retry</Text></Pressable> : null}</View> : null}
 
         {section === "Menu" ? <>
           <Card style={styles.formCard}>
@@ -459,7 +476,7 @@ export default function ManageScreen() {
         </> : null}
 
         {section === "Settings" ? <>
-          <Card style={styles.formCard}><Text style={styles.cardTitle}>Business & financial defaults</Text><Text style={styles.smallNote}>Currency is chosen when the workspace is created and stays fixed to protect menu prices and accounting. Tax begins at zero unless your manager sets it.</Text><Field label="BUSINESS NAME" value={businessNameValue} onChangeText={setBusinessName} placeholder="Business name" /><Text style={styles.fieldLabel}>WORKSPACE CURRENCY · LOCKED</Text><View style={{ minHeight: 42, justifyContent: "center", borderColor: palette.line, borderWidth: 1, borderRadius: 11, backgroundColor: palette.surface, paddingHorizontal: 11, marginBottom: 9 }}><Text style={{ color: palette.ink, fontSize: 12, fontWeight: "800" }}>{workspace?.currency ?? settings.data?.currency ?? "IDR"}</Text></View><Field label="BUSINESS TIME ZONE · IANA" value={businessTimezoneValue} onChangeText={setBusinessTimezone} placeholder="Asia/Jakarta" /><Field label="SALES TAX · %" value={taxPercentValue} onChangeText={setTaxPercent} placeholder="0" keyboardType="decimal-pad" /><PrimaryButton label={updateSettings.isPending ? "Saving…" : "Save business settings"} icon="save" onPress={() => void saveBusiness()} loading={updateSettings.isPending} /></Card>
+          <Card style={styles.formCard}><Text style={styles.cardTitle}>Business & financial defaults</Text><Text style={styles.smallNote}>Currency is chosen when the workspace is created and stays fixed to protect menu prices and accounting. Tax begins at zero unless your manager sets it.</Text><Field label="BUSINESS NAME" value={businessNameValue} onChangeText={setBusinessName} placeholder="Business name" /><Text style={styles.fieldLabel}>WORKSPACE CURRENCY · LOCKED</Text><View style={{ minHeight: 42, justifyContent: "center", borderColor: palette.line, borderWidth: 1, borderRadius: 11, backgroundColor: palette.surface, paddingHorizontal: 11, marginBottom: 9 }}><Text style={{ color: palette.ink, fontSize: 12, fontWeight: "800" }}>{workspace?.currency ?? settings.data?.currency ?? "IDR"}</Text></View><Field label="BUSINESS TIME ZONE · IANA" value={businessTimezoneValue} onChangeText={setBusinessTimezone} placeholder="Asia/Jakarta" /><Field label="SALES TAX · %" value={taxPercentValue} onChangeText={setTaxPercent} placeholder="0" keyboardType="decimal-pad" /><PrimaryButton label={updateSettings.isPending ? "Saving…" : "Save business settings"} icon="save" onPress={() => void saveBusiness()} loading={updateSettings.isPending} disabled={!settingsReady || updateSettings.isPending} /></Card>
           <SectionTitle title="Local register history" />
           <Card style={styles.formCard}><Text style={styles.cardTitle}>{legacyRead ? alreadyImported ? "Legacy import already used" : `${recordCount} records on this device` : "Looking for local records…"}</Text><Text style={styles.smallNote}>Your earlier local register stays on this device. Import only if its original amounts are already in {workspace?.currency}; this process never converts or silently copies values.</Text>{recordCount > 0 && !alreadyImported ? <><Pressable onPress={() => setLegacyConfirmed(!legacyConfirmed)} style={styles.confirmRow}><View style={[styles.checkbox, legacyConfirmed && styles.checkboxActive]}>{legacyConfirmed ? <MaterialIcons name="check" size={12} color={palette.white} /> : null}</View><Text style={styles.smallNote}>I confirm the local amounts use {workspace?.currency}.</Text></Pressable><PrimaryButton label={importLegacy.isPending ? "Importing…" : "Import local records once"} icon="cloud-upload" tone="light" disabled={!legacyConfirmed || importLegacy.isPending} loading={importLegacy.isPending} onPress={() => void importOldRecords()} /></> : null}{alreadyImported ? <Text style={styles.noticeText}>A prior import was completed from this device.</Text> : null}</Card>
         </> : null}

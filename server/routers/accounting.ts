@@ -3,7 +3,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { businessRecords } from "../../drizzle/schema";
-import { assertBalanced, businessDateBoundary, businessDateKey, makeJournalLine, roundAmount, summarizeProfitAndLoss } from "../../shared/accounting";
+import { assertBalanced, businessDateBoundary, businessDateKey, makeJournalLine, roundAmount, roundPositiveAmount, summarizeProfitAndLoss } from "../../shared/accounting";
 import { summarizeRecipeCosting } from "../../shared/recipe-costing";
 import type { CurrencyCode, Invoice, JournalEntry, JournalLine, PettyExpense, RecipeSaleCost, Transaction, VendorBill } from "../../shared/pos";
 import { saveBusinessRecord } from "../db";
@@ -99,6 +99,7 @@ export const accountingRouter = router({
     const subtotal = round(input.lines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0), currency);
     const tax = round(subtotal * ctx.member.business.taxRateBasisPoints / 10_000, currency);
     const total = round(subtotal + tax, currency);
+    if (roundPositiveAmount(subtotal, currency) === null || roundPositiveAmount(total, currency) === null) throw new TRPCError({ code: "BAD_REQUEST", message: `The invoice total must round to at least one ${currency} minor unit.` });
     const now = new Date().toISOString();
     const invoiceId = id();
     const number = `INV-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString("hex").toUpperCase()}`;
@@ -123,6 +124,7 @@ export const accountingRouter = router({
       if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Invoice not found." });
       const invoice = as<Invoice>(row.payload);
       if (invoice.status !== "draft") throw new TRPCError({ code: "BAD_REQUEST", message: "Only an unissued draft can be issued." });
+      if (roundPositiveAmount(invoice.subtotal, currency) === null || roundPositiveAmount(invoice.total, currency) === null) throw new TRPCError({ code: "BAD_REQUEST", message: `The invoice total must round to at least one ${currency} minor unit before it can be issued.` });
       const issue = parseBusinessDate(businessDateKey(Date.now(), timezone), timezone);
       const journal = await post(tx, ctx.member.businessId, ctx.user.openId, currency, issue.toISOString(), invoice.number, `Invoice ${invoice.number} · ${invoice.customerName}`, [
         makeJournalLine("1100", "Accounts receivable", invoice.total, 0, currency),
@@ -184,6 +186,7 @@ export const accountingRouter = router({
     const dueDate = parseBusinessDate(input.dueDate, timezone, true);
     if (dueDate < billDate) throw new TRPCError({ code: "BAD_REQUEST", message: "The due date must be on or after the bill date." });
     const amount = round(input.amount, currency);
+    if (roundPositiveAmount(amount, currency) === null) throw new TRPCError({ code: "BAD_REQUEST", message: `The bill amount must round to at least one ${currency} minor unit.` });
     const now = new Date().toISOString();
     const billId = id();
     const number = `BILL-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString("hex").toUpperCase()}`;

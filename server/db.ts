@@ -92,6 +92,12 @@ export async function listBusinessRecords(businessId: string, recordKind: string
     .orderBy(desc(businessRecords.createdAt));
 }
 
+export async function lockBusinessForUpdate(executor: any, businessId: string) {
+  const rows = await executor.select({ id: businesses.id }).from(businesses)
+    .where(eq(businesses.id, businessId)).for("update").limit(1);
+  if (!rows[0]) throw new Error("The workspace no longer exists.");
+}
+
 export async function saveBusinessRecord(
   executor: any,
   input: { businessId: string; recordKind: string; recordId: string; payload: Record<string, unknown>; actorOpenId: string },

@@ -25,8 +25,8 @@ export function money(value: number, currency: CurrencyCode = "IDR") {
   return formatMoney(value, currency);
 }
 
-export function shortTime(iso: string) {
-  return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+export function shortTime(iso: string, timezone?: string) {
+  return new Intl.DateTimeFormat(undefined, { ...(timezone ? { timeZone: timezone } : {}), hour: "numeric", minute: "2-digit" }).format(new Date(iso));
 }
 
 export function elapsedLabel(iso: string, now = Date.now()) {

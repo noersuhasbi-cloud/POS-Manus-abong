@@ -6,6 +6,21 @@ export function roundAmount(value: number, currency: CurrencyCode) {
   return Math.round((value + Number.EPSILON) * scale) / scale;
 }
 
+export function roundPositiveAmount(value: number, currency: CurrencyCode): number | null {
+  const amount = roundAmount(value, currency);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+export function formatBusinessTimestamp(value: string | Date, timezone: string, locale = "en-US") {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(locale, {
+    timeZone: timezone,
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
 export function formatMoney(value: number, currency: CurrencyCode = "IDR") {
   return new Intl.NumberFormat(currency === "IDR" ? "id-ID" : "en-US", {
     style: "currency",
@@ -34,6 +49,14 @@ function datePartsFor(value: Date | number, timezone: string) {
 export function businessDateKey(value: Date | number, timezone: string) {
   const { year, month, day } = datePartsFor(value, timezone);
   return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+export function isInBusinessDateRange(value: string | Date, startKey: string, endKey: string, timezone: string) {
+  if (startKey > endKey) return false;
+  const timestamp = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(timestamp.getTime())) return false;
+  const key = businessDateKey(timestamp, timezone);
+  return key >= startKey && key <= endKey;
 }
 
 export function shiftDateKey(value: string, days: number) {

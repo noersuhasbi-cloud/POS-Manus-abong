@@ -2,8 +2,8 @@ import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { useEffect, useMemo, useState } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { ScreenContainer } from "@/components/screen-container";
-import { Card, elapsedLabel, EmptyState, orderStatusColor, PageHeader, palette, Pill, PrimaryButton, StatusPill } from "@/components/pos/ui";
-import { type OrderStatus, type PosOrder, usePos } from "@/lib/pos-store";
+import { Card, elapsedLabel, EmptyState, orderStatusColor, PageHeader, palette, Pill, PrimaryButton, shortTime, StatusPill } from "@/components/pos/ui";
+import { type KitchenOrder, type OrderStatus, usePos } from "@/lib/pos-store";
 import { useWorkspace } from "@/lib/workspace-context";
 
 const filters = ["Active", "New", "Preparing", "Ready", "Completed", "Cancelled"] as const;
@@ -23,7 +23,7 @@ function nextAction(status: OrderStatus) {
   return { label: "Completed", icon: "done-all" as const };
 }
 
-function KitchenTicket({ order, onAdvance, now, canAdvance, busy, actionError }: { order: PosOrder; onAdvance: () => void; now: number; canAdvance: boolean; busy: boolean; actionError: string }) {
+function KitchenTicket({ order, onAdvance, now, timezone, canAdvance, busy, actionError }: { order: KitchenOrder; onAdvance: () => void; now: number; timezone: string; canAdvance: boolean; busy: boolean; actionError: string }) {
   const statusColor = orderStatusColor(order.status);
   const minutes = Math.floor((now - new Date(order.createdAt).getTime()) / 60_000);
   const slow = minutes >= 8 && order.status !== "completed";
@@ -31,7 +31,7 @@ function KitchenTicket({ order, onAdvance, now, canAdvance, busy, actionError }:
   return (
     <Card style={[styles.ticket, slow && order.status === "new" && styles.ticketLate]}>
       <View style={styles.ticketTop}>
-        <View style={styles.orderNumberWrap}><Text style={styles.orderNumber}>{order.number}</Text><Text style={styles.orderTime}>{new Date(order.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</Text></View>
+        <View style={styles.orderNumberWrap}><Text style={styles.orderNumber}>{order.number}</Text><Text style={styles.orderTime}>{shortTime(order.createdAt, timezone)}</Text></View>
         <View style={styles.ticketTopRight}><View style={[styles.timerPill, { backgroundColor: slow ? palette.coralSoft : statusColor.bg }]}><MaterialIcons name="schedule" size={13} color={slow ? palette.coral : statusColor.fg} /><Text style={[styles.timerText, { color: slow ? palette.coral : statusColor.fg }]}>{elapsedLabel(order.createdAt, now)}</Text></View><StatusPill status={order.status} /></View>
       </View>
       <View style={styles.ticketDivider} />
@@ -52,6 +52,7 @@ function KitchenTicket({ order, onAdvance, now, canAdvance, busy, actionError }:
 export default function KitchenScreen() {
   const { orders, updateOrderStatus } = usePos();
   const { workspace } = useWorkspace();
+  const timezone = workspace?.timezone ?? "Asia/Jakarta";
   const canAdvance = workspace?.role === "manager" || workspace?.role === "kitchen";
   const [filter, setFilter] = useState<KitchenFilter>("Active");
   const [now, setNow] = useState(INITIAL_KITCHEN_NOW);
@@ -73,7 +74,7 @@ export default function KitchenScreen() {
     return filtered.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }, [orders, filter]);
 
-  async function advance(order: PosOrder) {
+  async function advance(order: KitchenOrder) {
     setActionError("");
     setFailedOrderId(null);
     setPendingOrderId(order.id);
@@ -85,7 +86,7 @@ export default function KitchenScreen() {
   return (
     <ScreenContainer containerClassName="bg-background" safeAreaClassName="bg-background">
       <ScrollView style={styles.page} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.topStrip}><View style={styles.liveLabel}><View style={styles.liveDot} /><Text style={styles.liveText}>LIVE KITCHEN</Text></View><Text style={styles.shiftClock}>{new Date(now).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</Text></View>
+        <View style={styles.topStrip}><View style={styles.liveLabel}><View style={styles.liveDot} /><Text style={styles.liveText}>LIVE KITCHEN</Text></View><Text style={styles.shiftClock}>{shortTime(new Date(now).toISOString(), timezone)}</Text></View>
         <PageHeader eyebrow={`${workspace?.name ?? "Workspace"} · ${workspace?.role ?? "team"}`} title="Order board" subtitle="Cloud tickets refresh across cashier and kitchen stations." right={<View style={styles.activeCount}><Text style={styles.activeCountValue}>{activeCount}</Text><Text style={styles.activeCountLabel}>ACTIVE</Text></View>} />
         <Card style={styles.newTicketBanner}><View style={styles.bannerIcon}><MaterialIcons name="notifications-active" size={19} color={newCount ? palette.evergreen : palette.muted} /></View><View style={{ flex: 1 }}><Text style={styles.bannerTitle}>{newCount ? `${newCount} new ${newCount === 1 ? "ticket" : "tickets"}` : "You’re all caught up"}</Text><Text style={styles.bannerSub}>{newCount ? "Start the first ticket when your station is ready." : "New cashier orders will appear here."}</Text></View><Text style={styles.bannerArrow}>KITCHEN</Text></Card>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filters}>
@@ -94,7 +95,7 @@ export default function KitchenScreen() {
         {visibleOrders.length === 0 ? (
           <EmptyState icon={filter === "Completed" ? "done-all" : "soup-kitchen"} title={filter === "Completed" ? "No handoffs yet" : "Your pass is clear"} body={filter === "Completed" ? "Completed kitchen tickets will stay here for the shift." : "When the cashier completes a sale, its ticket will appear here instantly."} />
         ) : (
-          <View style={styles.ticketList}>{visibleOrders.map((order) => <KitchenTicket key={order.id} order={order} now={now} canAdvance={canAdvance} busy={pendingOrderId === order.id} actionError={failedOrderId === order.id ? actionError : ""} onAdvance={() => void advance(order)} />)}</View>
+          <View style={styles.ticketList}>{visibleOrders.map((order) => <KitchenTicket key={order.id} order={order} now={now} timezone={timezone} canAdvance={canAdvance} busy={pendingOrderId === order.id} actionError={failedOrderId === order.id ? actionError : ""} onAdvance={() => void advance(order)} />)}</View>
         )}
         <View style={styles.syncNote}><MaterialIcons name="cloud-done" size={16} color={palette.evergreen} /><Text style={styles.syncNoteText}>Shared workspace queue · online updates appear in seconds.</Text></View>
       </ScrollView>

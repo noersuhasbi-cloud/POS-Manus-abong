@@ -6,7 +6,7 @@ import { businessRecords } from "../../drizzle/schema";
 import { assertBalanced, makeJournalLine, roundAmount } from "../../shared/accounting";
 import type { CurrencyCode, JournalEntry, JournalLine, LoyaltySettings, MenuItem, Promotion } from "../../shared/pos";
 import { isPromotionActiveAt, isTimeRange } from "../../shared/promotions";
-import { saveBusinessRecord } from "../db";
+import { lockBusinessForUpdate, saveBusinessRecord } from "../db";
 import { cashierProcedure, managerProcedure, requireDatabase } from "../_core/business";
 import { router } from "../_core/trpc";
 
@@ -16,6 +16,19 @@ function hashCode(value: string) { return createHash("sha256").update(value.trim
 function normalizePhone(value: string) { return value.replace(/[^\d+]/g, ""); }
 function isDuplicateKey(error: unknown) { const candidate = error as { code?: string; cause?: { code?: string } } | null; return candidate?.code === "ER_DUP_ENTRY" || candidate?.cause?.code === "ER_DUP_ENTRY"; }
 function round(value: number, currency: CurrencyCode) { return roundAmount(value, currency); }
+
+async function getRecordTx(tx: any, businessId: string, kind: string, recordId: string) {
+  const rows = await tx.select().from(businessRecords)
+    .where(and(eq(businessRecords.businessId, businessId), eq(businessRecords.recordKind, kind), eq(businessRecords.recordId, recordId)))
+    .for("update").limit(1);
+  return rows[0] ?? null;
+}
+
+async function listPromotionRecordsTx(tx: any, businessId: string) {
+  return tx.select().from(businessRecords)
+    .where(and(eq(businessRecords.businessId, businessId), eq(businessRecords.recordKind, "promotion")))
+    .for("update");
+}
 
 async function post(tx: any, businessId: string, actor: string, currency: CurrencyCode, input: { date: string; reference: string; description: string; lines: JournalLine[] }) {
   assertBalanced(input.lines, currency);
@@ -63,40 +76,46 @@ export const programsRouter = router({
     const start = new Date(input.startsAt);
     const end = new Date(input.endsAt);
     if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid start and end date." });
-    const promotionItemIds = input.ruleType === "bogo" ? [input.buyItemId!, input.rewardItemId!] : input.ruleType === "bundle" ? (input.bundleItems ?? []).map((line) => line.menuItemId) : [];
-    if (promotionItemIds.length) {
-      const menuRows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "menuItem")));
-      const menuItems = new Map(menuRows.map((row) => [row.recordId, recordAs<MenuItem>(row.payload)]));
-      if (promotionItemIds.some((itemId) => { const item = menuItems.get(itemId); return !item || item.ingredientOnly === true; })) throw new TRPCError({ code: "BAD_REQUEST", message: "Promotion rules can include only sellable menu items in this workspace." });
-    }
-    const code = input.code?.trim().toUpperCase() || undefined;
-    const rows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "promotion")));
-    if (code && rows.some((row) => String(row.payload.code ?? "").toUpperCase() === code && row.recordId !== input.id)) throw new TRPCError({ code: "CONFLICT", message: "That coupon code is already in use." });
-    const existing = input.id ? rows.find((row) => row.recordId === input.id) : undefined;
-    const offer: Promotion = {
-      id: input.id || id(), name: input.name, code, discountType: input.discountType,
-      value: input.ruleType === "discount" && input.discountType === "fixed" ? round(input.value, currency) : input.value,
-      ruleType: input.ruleType,
-      buyItemId: input.ruleType === "bogo" ? input.buyItemId : undefined,
-      buyQuantity: input.ruleType === "bogo" ? input.buyQuantity : undefined,
-      rewardItemId: input.ruleType === "bogo" ? input.rewardItemId : undefined,
-      rewardQuantity: input.ruleType === "bogo" ? input.rewardQuantity : undefined,
-      bundleItems: input.ruleType === "bundle" ? input.bundleItems : undefined,
-      bundlePrice: input.ruleType === "bundle" && input.bundlePrice !== undefined ? round(input.bundlePrice, currency) : undefined,
-      dailyStartTime: input.dailyStartTime, dailyEndTime: input.dailyEndTime, weekdays: input.weekdays?.length ? [...input.weekdays].sort() : undefined,
-      startsAt: start.toISOString(), endsAt: end.toISOString(), active: input.active, maxRedemptions: input.maxRedemptions,
-      redemptionCount: Number(existing?.payload.redemptionCount ?? 0), createdAt: String(existing?.payload.createdAt ?? new Date().toISOString()),
-    };
-    await saveBusinessRecord(db, { businessId: ctx.member.businessId, recordKind: "promotion", recordId: offer.id, payload: offer as unknown as Record<string, unknown>, actorOpenId: ctx.user.openId });
-    return offer;
+    return db.transaction(async (tx) => {
+      await lockBusinessForUpdate(tx, ctx.member.businessId);
+      const promotionItemIds = input.ruleType === "bogo" ? [input.buyItemId!, input.rewardItemId!] : input.ruleType === "bundle" ? (input.bundleItems ?? []).map((line) => line.menuItemId) : [];
+      if (promotionItemIds.length) {
+        const menuRows = await tx.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "menuItem")));
+        const menuItems = new Map(menuRows.map((row: any) => [row.recordId, recordAs<MenuItem>(row.payload)]));
+        if (promotionItemIds.some((itemId) => { const item = menuItems.get(itemId); return !item || item.ingredientOnly === true; })) throw new TRPCError({ code: "BAD_REQUEST", message: "Promotion rules can include only sellable menu items in this workspace." });
+      }
+      const code = input.code?.trim().toUpperCase() || undefined;
+      const rows = await listPromotionRecordsTx(tx, ctx.member.businessId);
+      if (code && rows.some((row: any) => String(row.payload.code ?? "").toUpperCase() === code && row.recordId !== input.id)) throw new TRPCError({ code: "CONFLICT", message: "That coupon code is already in use." });
+      const existing = input.id ? rows.find((row: any) => row.recordId === input.id) : undefined;
+      const offer: Promotion = {
+        id: input.id || id(), name: input.name, code, discountType: input.discountType,
+        value: input.ruleType === "discount" && input.discountType === "fixed" ? round(input.value, currency) : input.value,
+        ruleType: input.ruleType,
+        buyItemId: input.ruleType === "bogo" ? input.buyItemId : undefined,
+        buyQuantity: input.ruleType === "bogo" ? input.buyQuantity : undefined,
+        rewardItemId: input.ruleType === "bogo" ? input.rewardItemId : undefined,
+        rewardQuantity: input.ruleType === "bogo" ? input.rewardQuantity : undefined,
+        bundleItems: input.ruleType === "bundle" ? input.bundleItems : undefined,
+        bundlePrice: input.ruleType === "bundle" && input.bundlePrice !== undefined ? round(input.bundlePrice, currency) : undefined,
+        dailyStartTime: input.dailyStartTime, dailyEndTime: input.dailyEndTime, weekdays: input.weekdays?.length ? [...input.weekdays].sort() : undefined,
+        startsAt: start.toISOString(), endsAt: end.toISOString(), active: input.active, maxRedemptions: input.maxRedemptions,
+        redemptionCount: Number(existing?.payload.redemptionCount ?? 0), createdAt: String(existing?.payload.createdAt ?? new Date().toISOString()),
+      };
+      await saveBusinessRecord(tx, { businessId: ctx.member.businessId, recordKind: "promotion", recordId: offer.id, payload: offer as unknown as Record<string, unknown>, actorOpenId: ctx.user.openId });
+      return offer;
+    });
   }),
 
   deactivatePromotion: managerProcedure.input(z.object({ id: z.string().uuid() })).mutation(async ({ ctx, input }) => {
     const db = await requireDatabase();
-    const rows = await db.select().from(businessRecords).where(and(eq(businessRecords.businessId, ctx.member.businessId), eq(businessRecords.recordKind, "promotion"), eq(businessRecords.recordId, input.id))).limit(1);
-    if (!rows[0]) throw new TRPCError({ code: "NOT_FOUND", message: "Promotion not found." });
-    await saveBusinessRecord(db, { businessId: ctx.member.businessId, recordKind: "promotion", recordId: input.id, payload: { ...rows[0].payload, active: false }, actorOpenId: ctx.user.openId });
-    return { success: true };
+    return db.transaction(async (tx) => {
+      await lockBusinessForUpdate(tx, ctx.member.businessId);
+      const row = await getRecordTx(tx, ctx.member.businessId, "promotion", input.id);
+      if (!row) throw new TRPCError({ code: "NOT_FOUND", message: "Promotion not found." });
+      await saveBusinessRecord(tx, { businessId: ctx.member.businessId, recordKind: "promotion", recordId: input.id, payload: { ...row.payload, active: false }, actorOpenId: ctx.user.openId });
+      return { success: true };
+    });
   }),
 
   giftCards: managerProcedure.query(async ({ ctx }) => {
@@ -120,6 +139,7 @@ export const programsRouter = router({
     const db = await requireDatabase();
     const currency = ctx.member.business.currency as CurrencyCode;
     const amount = round(input.amount, currency);
+    if (amount <= 0) throw new TRPCError({ code: "BAD_REQUEST", message: `Enter an amount that rounds to at least one ${currency} minor unit.` });
     if (input.paymentMethod === "QRIS" && !input.qrisVerified) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Verify the QRIS payment in the merchant app before issuing the card." });
     const code = randomBytes(8).toString("hex").toUpperCase();
     const cardId = id();

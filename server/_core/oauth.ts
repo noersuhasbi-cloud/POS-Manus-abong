@@ -10,7 +10,7 @@ import {
   getSessionCookieOptions,
 } from "./cookies";
 import { ENV } from "./env";
-import { decodeOAuthState, encodeOAuthState, isAllowedOAuthCallback, safeNonceMatches } from "./oauth-state";
+import { decodeOAuthState, encodeOAuthState, isAllowedOAuthCallback, isValidNativeOAuthState, safeNonceMatches } from "./oauth-state";
 import { sdk } from "./sdk";
 
 function getQueryParam(req: Request, key: string): string | undefined {
@@ -184,6 +184,11 @@ export function registerOAuthRoutes(app: Express) {
 
     if (!code || !state) {
       res.status(400).json({ error: "code and state are required" });
+      return;
+    }
+
+    if (!isValidNativeOAuthState(state)) {
+      res.status(400).json({ error: "The native sign-in state is missing or invalid. Start sign-in again." });
       return;
     }
 

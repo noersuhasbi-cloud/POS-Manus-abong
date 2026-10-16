@@ -4,6 +4,7 @@ export type OAuthState = {
   redirectUri: string;
   nonce?: string;
   returnOrigin?: string;
+  issuedAt?: number;
 };
 
 export function encodeOAuthState(state: OAuthState): string {
@@ -21,12 +22,13 @@ export function decodeOAuthState(encoded: string): OAuthState {
   try {
     const parsed: unknown = JSON.parse(decoded);
     if (parsed && typeof parsed === "object" && "redirectUri" in parsed) {
-      const value = parsed as { redirectUri?: unknown; nonce?: unknown; returnOrigin?: unknown };
+      const value = parsed as { redirectUri?: unknown; nonce?: unknown; returnOrigin?: unknown; issuedAt?: unknown };
       if (typeof value.redirectUri === "string" && value.redirectUri.length > 0) {
         return {
           redirectUri: value.redirectUri,
           ...(typeof value.nonce === "string" ? { nonce: value.nonce } : {}),
           ...(typeof value.returnOrigin === "string" ? { returnOrigin: value.returnOrigin } : {}),
+          ...(typeof value.issuedAt === "number" && Number.isFinite(value.issuedAt) ? { issuedAt: value.issuedAt } : {}),
         };
       }
     }
@@ -36,6 +38,19 @@ export function decodeOAuthState(encoded: string): OAuthState {
 
   if (/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(decoded)) return { redirectUri: decoded };
   throw new Error("OAuth state did not contain a valid redirect URI.");
+}
+
+export function isValidNativeOAuthState(encoded: string): boolean {
+  try {
+    const state = decodeOAuthState(encoded);
+    const ageMs = state.issuedAt === undefined ? Infinity : Date.now() - state.issuedAt;
+    return typeof state.nonce === "string"
+      && /^[a-f0-9]{64}$/.test(state.nonce)
+      && ageMs >= -60_000
+      && ageMs <= 10 * 60_000;
+  } catch {
+    return false;
+  }
 }
 
 export function safeNonceMatches(expected: string | undefined, actual: string | undefined): boolean {

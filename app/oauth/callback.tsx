@@ -1,6 +1,7 @@
 import { ThemedView } from "@/components/themed-view";
 import * as Api from "@/lib/_core/api";
 import * as Auth from "@/lib/_core/auth";
+import { consumeNativeOAuthState } from "@/constants/oauth";
 import * as Linking from "expo-linking";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
@@ -47,41 +48,27 @@ export default function OAuthCallback() {
 
   useEffect(() => {
     const handleCallback = async () => {
-      const callbackKey = params.sessionToken
-        ? `token:${params.sessionToken}`
-        : params.code && params.state
-          ? `code:${params.code}:${params.state}`
-          : null;
-      if (callbackKey && completedCallbackKeys.has(callbackKey)) {
-        router.replace("/");
-        return;
-      }
       try {
-        if (params.sessionToken) {
-          await synchronizeAuthenticatedSession(params.sessionToken, refreshAuth);
-          if (callbackKey) completedCallbackKeys.add(callbackKey);
-          setStatus("success");
-          setTimeout(() => router.replace("/"), 350);
-          return;
-        }
-
         let url: string | null = null;
-        if (params.code || params.state || params.error) {
+        if (params.code || params.state || params.error || params.sessionToken) {
           const urlParams = new URLSearchParams();
           if (params.code) urlParams.set("code", params.code);
           if (params.state) urlParams.set("state", params.state);
           if (params.error) urlParams.set("error", params.error);
+          if (params.sessionToken) urlParams.set("sessionToken", params.sessionToken);
           url = `?${urlParams.toString()}`;
         } else {
           url = await Linking.getInitialURL();
         }
 
         const error = params.error || (url ? new URL(url, "http://dummy").searchParams.get("error") : null);
-        if (error) throw new Error(error);
+        if (error) {
+          throw new Error(error);
+        }
 
         let code = params.code ?? null;
         let state = params.state ?? null;
-        let sessionToken: string | null = null;
+        let sessionToken: string | null = params.sessionToken ?? null;
         if (url) {
           try {
             const urlObj = new URL(url);
@@ -97,6 +84,18 @@ export default function OAuthCallback() {
               if (key === "sessionToken") sessionToken = decodeURIComponent(value);
             });
           }
+        }
+
+        const callbackKey = sessionToken
+          ? `token:${sessionToken}:${state ?? ""}`
+          : code && state ? `code:${code}:${state}` : null;
+        if (callbackKey && completedCallbackKeys.has(callbackKey)) {
+          router.replace("/");
+          return;
+        }
+
+        if (Platform.OS !== "web" && !(await consumeNativeOAuthState(state))) {
+          throw new Error("This sign-in link is expired or does not match the current attempt. Please start sign-in again.");
         }
 
         if (!sessionToken) {

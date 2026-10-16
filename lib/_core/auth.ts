@@ -1,6 +1,7 @@
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 import { SESSION_TOKEN_KEY, USER_INFO_KEY } from "@/constants/oauth";
+import { bindLegacySnapshotOwner } from "@/lib/legacy-storage";
 
 export type User = {
   id: number;
@@ -97,12 +98,14 @@ export async function setUserInfo(user: User): Promise<void> {
     if (Platform.OS === "web") {
       // Use localStorage for web
       window.localStorage.setItem(USER_INFO_KEY, JSON.stringify(user));
+      await bindLegacySnapshotOwner(user.openId);
       console.log("[Auth] User info stored in localStorage successfully");
       return;
     }
 
     // Use SecureStore for native
     await SecureStore.setItemAsync(USER_INFO_KEY, JSON.stringify(user));
+    await bindLegacySnapshotOwner(user.openId);
     console.log("[Auth] User info stored in SecureStore successfully");
   } catch {
     console.error("[Auth] Failed to set user info");

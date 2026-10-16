@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   decodeOAuthState,
   encodeOAuthState,
+  isValidNativeOAuthState,
   isAllowedOAuthCallback,
   safeNonceMatches,
 } from "../server/_core/oauth-state";
@@ -20,6 +21,14 @@ describe("OAuth state", () => {
     const redirectUri = "manus12345://oauth/callback";
     const legacy = Buffer.from(redirectUri, "utf8").toString("base64");
     expect(decodeOAuthState(legacy)).toEqual({ redirectUri });
+    expect(isValidNativeOAuthState(legacy)).toBe(false);
+  });
+
+  it("requires a fresh 256-bit hexadecimal nonce for native code exchange", () => {
+    const valid = encodeOAuthState({ redirectUri: "manus12345://oauth/callback", nonce: "a".repeat(64), issuedAt: Date.now() });
+    expect(isValidNativeOAuthState(valid)).toBe(true);
+    expect(isValidNativeOAuthState(encodeOAuthState({ redirectUri: "manus12345://oauth/callback", nonce: "short" }))).toBe(false);
+    expect(isValidNativeOAuthState(encodeOAuthState({ redirectUri: "manus12345://oauth/callback", nonce: "a".repeat(64), issuedAt: Date.now() - 11 * 60_000 }))).toBe(false);
   });
 
   it("requires both nonce values and compares them safely", () => {
